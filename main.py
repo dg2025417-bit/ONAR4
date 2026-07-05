@@ -2,6 +2,7 @@ import base64
 import io
 import json
 import os
+import tempfile
 
 import streamlit as st
 import streamlit.components.v1 as components
@@ -24,6 +25,236 @@ SLOTS = [
 ]
 
 NUM_SHOTS = len(SLOTS)
+
+# ----------------------------------------------------------------------------
+# 카메라 촬영용 커스텀 컴포넌트
+#
+# streamlit.components.v1.html()은 화면 표시만 될 뿐 JS -> Python 값 반환이
+# 되지 않으므로, 반드시 declare_component(path=...)로 등록된 진짜 양방향
+# 컴포넌트를 사용해야 한다. 프로젝트 폴더에 별도 파일을 추가하지 않기 위해,
+# 아래 HTML을 앱 실행 시점에 임시 디렉터리에 자동으로 써 두고 그 경로를
+# 컴포넌트로 등록한다 (저장소에는 파일이 추가되지 않음).
+# ----------------------------------------------------------------------------
+_CAMERA_COMPONENT_HTML = r"""
+<!DOCTYPE html>
+<html lang="ko">
+<head>
+<meta charset="UTF-8" />
+<style>
+  html, body {
+    margin:0; padding:0;
+    font-family:'Pretendard','Apple SD Gothic Neo',sans-serif;
+    background:transparent;
+  }
+  #app-root {
+    display:flex;flex-direction:column;align-items:center;
+    padding:4px 0 12px 0;
+  }
+  #video-wrap {
+    position:relative;
+    width:100%;
+    max-width:520px;
+    aspect-ratio:388/289;
+    background:#000;
+    border-radius:18px;
+    overflow:hidden;
+    box-shadow:0 6px 24px rgba(0,0,0,.35);
+  }
+  #video {
+    width:100%;height:100%;object-fit:cover;
+    transform:scaleX(-1); /* 거울 모드 */
+  }
+  #countdown {
+    position:absolute;top:0;left:0;width:100%;height:100%;
+    display:flex;align-items:center;justify-content:center;
+    font-size:6rem;font-weight:800;color:#fff;
+    text-shadow:0 0 20px rgba(0,0,0,.8);
+    background:rgba(0,0,0,0.15);
+    opacity:0;pointer-events:none;transition:opacity .1s;
+  }
+  #flash {
+    position:absolute;top:0;left:0;width:100%;height:100%;
+    background:#fff;opacity:0;pointer-events:none;
+  }
+  #status {
+    margin-top:14px;font-size:1.1rem;font-weight:700;color:#222;
+    text-align:center;
+  }
+  #shotBtn {
+    margin-top:16px;width:100%;max-width:520px;height:56px;
+    font-size:1.1rem;font-weight:800;color:#fff;border:none;border-radius:14px;
+    background:linear-gradient(135deg,#2b2b2b,#111);cursor:pointer;
+  }
+  #shotBtn:disabled { opacity:.5;cursor:not-allowed; }
+  #thumbs { display:flex;gap:8px;margin-top:14px; }
+  #thumbs img {
+    width:64px;height:48px;object-fit:cover;border-radius:6px;
+    border:2px solid #333;
+  }
+</style>
+</head>
+<body>
+  <div id="app-root">
+    <div id="video-wrap">
+      <video id="video" autoplay playsinline muted></video>
+      <div id="countdown"></div>
+      <div id="flash"></div>
+    </div>
+
+    <div id="status">카메라를 준비하고 있어요...</div>
+    <button id="shotBtn" disabled>촬영 시작</button>
+    <div id="thumbs"></div>
+
+    <canvas id="canvas" style="display:none;"></canvas>
+  </div>
+
+<script>
+  function sendMessageToStreamlit(type, data) {
+    var outData = Object.assign({
+      isStreamlitMessage: true,
+      type: type,
+    }, data);
+    window.parent.postMessage(outData, "*");
+  }
+
+  function componentReady() {
+    sendMessageToStreamlit("streamlit:componentReady", {apiVersion: 1});
+  }
+
+  function setFrameHeight(height) {
+    sendMessageToStreamlit("streamlit:setFrameHeight", {height: height});
+  }
+
+  function setComponentValue(value) {
+    sendMessageToStreamlit("streamlit:setComponentValue", {value: value, dataType: "json"});
+  }
+
+  function reportHeight() {
+    setFrameHeight(document.documentElement.scrollHeight + 10);
+  }
+
+  let TOTAL_SHOTS = 4;
+  let started = false;
+
+  window.addEventListener("message", function(event) {
+    const data = event.data;
+    if (!data || data.type !== "streamlit:render") return;
+    if (data.args && typeof data.args.num_shots === "number") {
+      TOTAL_SHOTS = data.args.num_shots;
+    }
+    if (!started) {
+      started = true;
+      startCamera();
+    }
+    reportHeight();
+  });
+
+  componentReady();
+  window.addEventListener("load", function() {
+    setTimeout(reportHeight, 200);
+  });
+
+  const video = document.getElementById("video");
+  const canvas = document.getElementById("canvas");
+  const countdownEl = document.getElementById("countdown");
+  const flashEl = document.getElementById("flash");
+  const statusEl = document.getElementById("status");
+  const shotBtn = document.getElementById("shotBtn");
+  const thumbsEl = document.getElementById("thumbs");
+
+  let shotsTaken = 0;
+  let photos = [];
+  let busy = false;
+
+  async function startCamera() {
+    try {
+      const stream = await navigator.mediaDevices.getUserMedia({
+        video: { facingMode: "user", width: { ideal: 1280 }, height: { ideal: 960 } },
+        audio: false
+      });
+      video.srcObject = stream;
+      statusEl.textContent = "준비 완료! 버튼을 눌러 촬영을 시작하세요 (1/" + TOTAL_SHOTS + ")";
+      shotBtn.disabled = false;
+      shotBtn.textContent = "촬영 시작";
+    } catch (err) {
+      statusEl.textContent = "카메라 접근이 거부되었습니다. 브라우저 권한을 확인해주세요.";
+      console.error(err);
+    }
+    setTimeout(reportHeight, 300);
+  }
+
+  function sleep(ms) { return new Promise(r => setTimeout(r, ms)); }
+
+  async function runCountdownAndCapture() {
+    if (busy || shotsTaken >= TOTAL_SHOTS) return;
+    busy = true;
+    shotBtn.disabled = true;
+
+    for (const n of [3, 2, 1]) {
+      countdownEl.textContent = n;
+      countdownEl.style.opacity = 1;
+      await sleep(600);
+      countdownEl.style.opacity = 0;
+      await sleep(150);
+    }
+
+    flashEl.style.opacity = 1;
+    setTimeout(() => { flashEl.style.opacity = 0; }, 150);
+
+    const vw = video.videoWidth || 1280;
+    const vh = video.videoHeight || 960;
+    canvas.width = vw;
+    canvas.height = vh;
+    const ctx = canvas.getContext("2d");
+    ctx.translate(vw, 0);
+    ctx.scale(-1, 1);
+    ctx.drawImage(video, 0, 0, vw, vh);
+    const dataUrl = canvas.toDataURL("image/jpeg", 0.92);
+    photos.push(dataUrl);
+    shotsTaken += 1;
+
+    const thumb = document.createElement("img");
+    thumb.src = dataUrl;
+    thumbsEl.appendChild(thumb);
+
+    if (shotsTaken < TOTAL_SHOTS) {
+      statusEl.textContent = shotsTaken + "/" + TOTAL_SHOTS + " 촬영 완료! 다음 촬영을 위해 버튼을 눌러주세요.";
+      shotBtn.textContent = "다음 사진 촬영 (" + (shotsTaken + 1) + "/" + TOTAL_SHOTS + ")";
+      shotBtn.disabled = false;
+      busy = false;
+    } else {
+      statusEl.textContent = "촬영이 모두 끝났습니다! 결과를 준비하는 중...";
+      shotBtn.style.display = "none";
+      const tracks = video.srcObject ? video.srcObject.getTracks() : [];
+      tracks.forEach(t => t.stop());
+      setTimeout(function() {
+        setComponentValue(photos);
+      }, 400);
+    }
+    setTimeout(reportHeight, 200);
+  }
+
+  shotBtn.addEventListener("click", runCountdownAndCapture);
+</script>
+</body>
+</html>
+"""
+
+
+@st.cache_resource
+def _get_camera_component():
+    tmp_dir = tempfile.mkdtemp(prefix="camera_component_")
+    with open(os.path.join(tmp_dir, "index.html"), "w", encoding="utf-8") as f:
+        f.write(_CAMERA_COMPONENT_HTML)
+    return components.declare_component("camera_capture", path=tmp_dir)
+
+
+_camera_component = _get_camera_component()
+
+
+def camera_capture(num_shots=NUM_SHOTS, key=None):
+    return _camera_component(num_shots=num_shots, key=key, default=None)
+
 
 # 스트림릿 기본 여백/헤더 숨기기 + 배경 스타일
 st.markdown(
@@ -137,185 +368,8 @@ def render_start():
 def render_capture():
     st.markdown("<h3 class='center-text'>촬영 중... (총 4컷)</h3>", unsafe_allow_html=True)
 
-    camera_html = f"""
-    <div id="app-root" style="display:flex;flex-direction:column;align-items:center;
-        font-family:'Pretendard','Apple SD Gothic Neo',sans-serif;">
-      <style>
-        #video-wrap {{
-          position:relative;
-          width:100%;
-          max-width:520px;
-          aspect-ratio:388/289;
-          background:#000;
-          border-radius:18px;
-          overflow:hidden;
-          box-shadow:0 6px 24px rgba(0,0,0,.35);
-        }}
-        #video {{
-          width:100%;height:100%;object-fit:cover;
-          transform:scaleX(-1); /* 거울 모드 */
-        }}
-        #countdown {{
-          position:absolute;top:0;left:0;width:100%;height:100%;
-          display:flex;align-items:center;justify-content:center;
-          font-size:6rem;font-weight:800;color:#fff;
-          text-shadow:0 0 20px rgba(0,0,0,.8);
-          background:rgba(0,0,0,0.15);
-          opacity:0;pointer-events:none;transition:opacity .1s;
-        }}
-        #flash {{
-          position:absolute;top:0;left:0;width:100%;height:100%;
-          background:#fff;opacity:0;pointer-events:none;
-        }}
-        #status {{
-          margin-top:14px;font-size:1.1rem;font-weight:700;color:#222;
-        }}
-        #shotBtn {{
-          margin-top:16px;width:100%;max-width:520px;height:56px;
-          font-size:1.1rem;font-weight:800;color:#fff;border:none;border-radius:14px;
-          background:linear-gradient(135deg,#2b2b2b,#111);cursor:pointer;
-        }}
-        #shotBtn:disabled {{ opacity:.5;cursor:not-allowed; }}
-        #thumbs {{ display:flex;gap:8px;margin-top:14px; }}
-        #thumbs img {{
-          width:64px;height:48px;object-fit:cover;border-radius:6px;
-          border:2px solid #333;
-        }}
-      </style>
+    component_value = camera_capture(num_shots=NUM_SHOTS, key="camera_capture")
 
-      <div id="video-wrap">
-        <video id="video" autoplay playsinline muted></video>
-        <div id="countdown"></div>
-        <div id="flash"></div>
-      </div>
-
-      <div id="status">카메라를 준비하고 있어요...</div>
-      <button id="shotBtn" disabled>촬영 시작</button>
-      <div id="thumbs"></div>
-
-      <canvas id="canvas" style="display:none;"></canvas>
-
-      <script>
-        // ---- Streamlit 컴포넌트 통신용 helper ----
-        function sendMessageToStreamlitClient(type, data) {{
-          var outData = Object.assign({{
-            isStreamlitMessage: true,
-            type: type,
-          }}, data);
-          window.parent.postMessage(outData, "*");
-        }}
-        function initStreamlit() {{
-          sendMessageToStreamlitClient("streamlit:componentReady", {{apiVersion: 1}});
-        }}
-        function setFrameHeight(height) {{
-          sendMessageToStreamlitClient("streamlit:setFrameHeight", {{height: height}});
-        }}
-        function sendValueToStreamlit(value) {{
-          sendMessageToStreamlitClient("streamlit:setComponentValue", {{value: value, dataType: "json"}});
-        }}
-
-        initStreamlit();
-        window.addEventListener("load", function() {{
-          setFrameHeight(document.documentElement.scrollHeight + 20);
-        }});
-
-        const video = document.getElementById("video");
-        const canvas = document.getElementById("canvas");
-        const countdownEl = document.getElementById("countdown");
-        const flashEl = document.getElementById("flash");
-        const statusEl = document.getElementById("status");
-        const shotBtn = document.getElementById("shotBtn");
-        const thumbsEl = document.getElementById("thumbs");
-
-        const TOTAL_SHOTS = {NUM_SHOTS};
-        let shotsTaken = 0;
-        let photos = [];
-        let busy = false;
-
-        async function startCamera() {{
-          try {{
-            const stream = await navigator.mediaDevices.getUserMedia({{
-              video: {{ facingMode: "user", width: {{ideal:1280}}, height: {{ideal:960}} }},
-              audio: false
-            }});
-            video.srcObject = stream;
-            statusEl.textContent = "준비 완료! 버튼을 눌러 촬영을 시작하세요 (1/" + TOTAL_SHOTS + ")";
-            shotBtn.disabled = false;
-            shotBtn.textContent = "촬영 시작";
-          }} catch (err) {{
-            statusEl.textContent = "카메라 접근이 거부되었습니다. 브라우저 권한을 확인해주세요.";
-            console.error(err);
-          }}
-          setTimeout(function() {{
-            setFrameHeight(document.documentElement.scrollHeight + 20);
-          }}, 300);
-        }}
-
-        function sleep(ms) {{ return new Promise(r => setTimeout(r, ms)); }}
-
-        async function runCountdownAndCapture() {{
-          if (busy || shotsTaken >= TOTAL_SHOTS) return;
-          busy = true;
-          shotBtn.disabled = true;
-
-          for (const n of [3, 2, 1]) {{
-            countdownEl.textContent = n;
-            countdownEl.style.opacity = 1;
-            await sleep(600);
-            countdownEl.style.opacity = 0;
-            await sleep(150);
-          }}
-
-          // 플래시 효과
-          flashEl.style.opacity = 1;
-          setTimeout(() => {{ flashEl.style.opacity = 0; }}, 150);
-
-          // 캡처 (화면과 동일하게 좌우반전 저장)
-          const vw = video.videoWidth || 1280;
-          const vh = video.videoHeight || 960;
-          canvas.width = vw;
-          canvas.height = vh;
-          const ctx = canvas.getContext("2d");
-          ctx.translate(vw, 0);
-          ctx.scale(-1, 1);
-          ctx.drawImage(video, 0, 0, vw, vh);
-          const dataUrl = canvas.toDataURL("image/jpeg", 0.92);
-          photos.push(dataUrl);
-          shotsTaken += 1;
-
-          const thumb = document.createElement("img");
-          thumb.src = dataUrl;
-          thumbsEl.appendChild(thumb);
-
-          if (shotsTaken < TOTAL_SHOTS) {{
-            statusEl.textContent = shotsTaken + "/" + TOTAL_SHOTS + " 촬영 완료! 다음 촬영을 위해 버튼을 눌러주세요.";
-            shotBtn.textContent = "다음 사진 촬영 (" + (shotsTaken + 1) + "/" + TOTAL_SHOTS + ")";
-            shotBtn.disabled = false;
-            busy = false;
-          }} else {{
-            statusEl.textContent = "촬영이 모두 끝났습니다! 결과를 준비하는 중...";
-            shotBtn.style.display = "none";
-            const tracks = video.srcObject ? video.srcObject.getTracks() : [];
-            tracks.forEach(t => t.stop());
-            setTimeout(function() {{
-              sendValueToStreamlit(photos);
-            }}, 500);
-          }}
-          setTimeout(function() {{
-            setFrameHeight(document.documentElement.scrollHeight + 20);
-          }}, 200);
-        }}
-
-        shotBtn.addEventListener("click", runCountdownAndCapture);
-        startCamera();
-      </script>
-    </div>
-    """
-
-    component_value = components.html(camera_html, height=760, scrolling=False)
-
-    # components.html()은 실제 값이 오기 전까지 기본값으로 0을 반환할 수 있으므로
-    # 반드시 "리스트인지"와 "사진 4장이 맞는지"까지 확인한 뒤에만 처리한다.
     if component_value and st.session_state.photos is None:
         photos = component_value
         if isinstance(photos, str):
