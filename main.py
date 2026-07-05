@@ -314,13 +314,20 @@ def render_capture():
 
     component_value = components.html(camera_html, height=760, scrolling=False)
 
-    if component_value is not None and st.session_state.photos is None:
+    # components.html()은 실제 값이 오기 전까지 기본값으로 0을 반환할 수 있으므로
+    # 반드시 "리스트인지"와 "사진 4장이 맞는지"까지 확인한 뒤에만 처리한다.
+    if component_value and st.session_state.photos is None:
         photos = component_value
         if isinstance(photos, str):
-            photos = json.loads(photos)
-        st.session_state.photos = photos
-        st.session_state.result_image = build_final_image(photos)
-        go_to("result")
+            try:
+                photos = json.loads(photos)
+            except (json.JSONDecodeError, TypeError):
+                photos = None
+
+        if isinstance(photos, list) and len(photos) == NUM_SHOTS:
+            st.session_state.photos = photos
+            st.session_state.result_image = build_final_image(photos)
+            go_to("result")
 
     st.write("")
     if st.button("⬅ 처음으로"):
